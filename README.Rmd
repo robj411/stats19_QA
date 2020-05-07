@@ -1,0 +1,212 @@
+---
+title: "Stats19 quality assessment"
+output: rmarkdown::github_document
+---
+  
+
+## The data
+
+We're looking at Stats19 data, police records of road-traffic collisions (RTCs) that occur on roads in the UK. Of the many variables recorded in this dataset, we consider the following:
+
+  - years 2005 to 2017
+  - 78 local authorities (LAs), which belong to one of nine city regions in England
+  - collisions that involve at least two parties
+  - collisions in which at least one person was slightly, seriously, or fatally injured.
+
+## The question
+
+Specifically, we're looking at the recorded age and gender information of people involved in an RTC in which at least one other person was injured. (This person may or may not have been injured themselves.) We use these data to try to address the following questions:
+
+ - can we assess the quality of the Stats19 dataset?
+ - does the quality differ between different city regions?
+
+
+
+
+```{r setup, echo=F}
+suppressPackageStartupMessages({library(data.table)
+library(stringr)
+library(dplyr)
+library(stats)
+library(tidyr)
+library(splines)
+library(pracma)
+})
+
+saved_objects <- readRDS('saved_objects.Rds')
+for(i in 1:length(saved_objects)) assign(names(saved_objects)[i],saved_objects[[i]])
+
+model_modes <- c('pedestrian','cyclist','car/taxi','motorcycle')
+cols <- rainbow(length(codes_for_stats19))
+
+if(!exists('stats19')){
+  ## github.com/metahit/mh-injury
+  mh_path <- "../mh-injury/"
+  overflow_path <- paste0(mh_path,"/rds_storage/")
+  codes_for_stats19 <- readRDS(paste0(overflow_path,'codes_for_stats19.Rds'))
+  hr <- readRDS(paste0(overflow_path,'hitrun.rds'))
+  colnames(hr)[2] <- 'veh_reference'
+  stats19 <- readRDS(paste0(overflow_path,'processed_injuries_3.Rds'))
+  stats19 <- subset(stats19,strike_mode!='NOV')
+  stats19 <- left_join(stats19,hr[hr$accident_index%in%stats19$accident_index,],by=c('veh_reference','accident_index'))
+}
+
+if(!exists('age_region')) age_region <- sapply(0:100,function(y)sapply(names(codes_for_stats19),function(x)nrow(subset(stats19,strike_age==y&region==x))))
+if(!exists('age_la')) age_la <- sapply(0:100,function(y)sapply(unique(stats19$local_authority_.highway.),function(x)nrow(subset(stats19,strike_age==y&local_authority_.highway.==x))))
+
+```
+
+## Descriptive 
+
+Here is the distribution of ages for those people, for the nine city regions:
+
+```{r plot ages,echo=F}
+
+par(mar=c(5,5,2,2)); matplot(t(repmat(c(0:100),nrow(age_region),1)),t(age_region),lwd=2,typ='l',lty=1,frame=F,xlab='Age',ylab='Count',cex.axis=1.5,cex.lab=1.5,col=cols)
+legend(legend=rev(names(codes_for_stats19)),col=rev(cols),x=65,y=8000,bty='n',lwd=2)
+
+```
+
+London has the most events (as it's the biggest city), followed by Leeds, the West Midlands, and Greater Manchester, followed by Sheffield, Liverpool, the North East, Nottingham and Bristol.
+
+There are some spikes in the data, most noticeable for Greater Manchester at age 30, where the spike exceeds the count for London. The spikes are present for some cities but not all, and are most prominent at ages that are multiples of ten, followed by ages that are multiples of 5.
+
+## Quantifying quality
+
+In an attempt to quantify the spikiness, we normalise each city's trajectory, and take the sum of the absolute differences from point to point. These are the statistics for the city regions:
+
+```{r plot city variability,echo=F}
+
+age_norm <- apply(age_region,1,function(x) x/sum(x))
+
+variability <- apply(age_norm,2,function(x)sum(abs(diff(x))))
+par(mar=c(8,5,2,2))
+plot(1:9,variability,col=cols,pch=16,frame=F,ylab='Age variability',xlab='',cex.axis=1.5,cex.lab=1.5,xaxt='n',cex=2)
+axis(1,at=1:9,labels=names(codes_for_stats19),las=2)
+
+```
+
+As expected, Greater Manchester has the most spikiness, followed by Bristol, then Liverpool, then the other six, which are similar to each other.
+
+We can calculate the same statistic for each LA:
+
+```{r plot la variability,echo=F}
+
+age_norm <- apply(age_la,1,function(x) x/sum(x))
+
+variability <- apply(age_norm,2,function(x)sum(abs(diff(x))))
+byla <- cbind(sapply(as.character(unique(stats19$local_authority_.highway.)),function(x)names(codes_for_stats19)[sapply(codes_for_stats19,function(y)x%in%y)]),variability)
+par(mar=c(8,5,2,2))
+plot(match(byla[,1],names(codes_for_stats19)),byla[,2],col=cols[match(byla[,1],names(codes_for_stats19))],pch=16,frame=F,ylab='Age variability',xlab='',cex.axis=1.5,cex.lab=1.5,xaxt='n')
+axis(1,at=1:9,labels=names(codes_for_stats19),las=2)
+
+```
+
+which shows a systematic difference between LAs in terms of how spiky the age trajectories are.
+
+
+```{r completeness,echo=F}
+if(!exists('age_completeness')) age_completeness <- sapply(unique(stats19$local_authority_.highway.),function(x)nrow(subset(stats19,!is.na(strike_age)&local_authority_.highway.==x))/
+                         sum(stats19$local_authority_.highway.==x))
+
+if(!exists('gender_completeness')) gender_completeness <- sapply(unique(stats19$local_authority_.highway.),function(x)nrow(subset(stats19,!is.na(strike_male)&local_authority_.highway.==x))/
+                                sum(stats19$local_authority_.highway.==x))
+if(!exists('completeness')) completeness <- sapply(unique(stats19$local_authority_.highway.),function(x)nrow(subset(stats19,!is.na(strike_male)&!is.na(strike_age)&local_authority_.highway.==x))/
+                         sum(stats19$local_authority_.highway.==x))
+
+```
+
+## Correlates: missing information, and gender
+
+Most ages are recorded as a number between 0 and 103. Some ages are recorded as 'NA', meaning no value was given. Assuming that no value was given in cases where the age was unknown, we speculate that city regions with spikier trajectories have fewer cases of unknown age, as the spike in values at age 30 might reflect a combination of cases where the age was actually 30, and cases where the age was unknown and 30 was guessed. We define 'completeness' as the fraction of values that are not NA, and its counterpart (1-completeness) as missingness.
+
+```{r plot age completeness,echo=F}
+
+
+par(mar=c(5,5,2,2)); plot(variability,age_completeness,col=cols[match(byla[,1],names(codes_for_stats19))],pch=16,cex=2,xlab='Age variability',ylab='Age completeness',frame=F,cex.axis=1.5,cex.lab=1.5)
+legend(legend=rev(names(codes_for_stats19)),col=rev(cols),x=0.3,y=0.82,bty='n',lwd=2)
+
+```
+
+There is some correlation and, again, there is some consistency between the LAs within a city region, with the Greater Manchester LAs having the highest spikiness and the highest rate of age entry completeness. London occupies the other end of the spectrum, with some of the lowest-variability LAs and the lowest rates of age completion. Liverpool and Bristol LAs lie between London and Greater Manchester, while Leeds, Sheffield and the North East have low age variability but higher completion, suggesting perhaps a systematic difference in recording. There is a distinct gap in the bottom-right corner, in that no LAs have high variability and low completion rate in age, as we might expect.
+
+Another item of information recorded in Stats19 is gender. We might expect completeness of gender to correlate with that of age. However, we can't spot patterns like spikiness, as there are only three categories available: male, female, and NA. 
+
+
+```{r plot gender completeness,echo=F}
+
+par(mar=c(5,5,2,2)); plot(gender_completeness,age_completeness,col=cols[match(byla[,1],names(codes_for_stats19))],pch=16,cex=2,ylab='Age completeness',xlab='Gender completeness',frame=F,cex.axis=1.5,cex.lab=1.5)
+legend(legend=rev(names(codes_for_stats19)),col=rev(cols),x=0.225,y=0.8,bty='n',lwd=2)
+
+```
+
+As expected, there is some correlation between gender completeness and age completeness and, again, a separation is suggested between city regions who follow a similar gradient but with a different intercept. West Midlands and London seem to be on the same line, with Liverpool a step up, and the others following a similar pattern with a higher base level of age completeness.
+
+Finally, plotting gender completeness against age variability highlights an outlier, the City of Bristol, which has high age variability but low gender completion, and is far from the other three LAs from its city region.
+
+```{r plot var and gender completeness,echo=F}
+
+
+par(mar=c(5,5,2,2)); plot(variability,gender_completeness,col=cols[match(byla[,1],names(codes_for_stats19))],pch=16,cex=2,xlab='Age variability',ylab='Gender completeness',frame=F,cex.axis=1.5,cex.lab=1.5,xlim=c(0.096,0.48))
+text('City of Bristol',x=0.37,y=0.8475,cex=1.5,pos=4)
+#legend(legend=rev(names(codes_for_stats19)),col=rev(cols),x=0.315,y=0.905,bty='n',lwd=2)
+```
+
+
+## The outlier
+
+It's not clear what is different about the City of Bristol. There is nothing that stands out about its other covariates.
+
+The Bristol city region as a whole is distinct from the other city regions in the ratio of age missingness to gender missingness to overall missingness (both). All other city regions have lowest age completion, higher gender completion, and similar completion of 'both' to 'gender'. It fits with intuition that it's possible to know, or guess, gender and not age, and unlikely to know, or guess, age and not gender. Greater Manchester differs slightly, in that there is less overlap in missingness between age and gender. (So there are many cases where age is known and gender isn't, but more vice versa.)
+
+```{r ordinal completeness,echo=F}
+
+if(!exists('cities')) cities <- sapply(names(codes_for_stats19),function(x){
+  brist <- subset(stats19,region==x)
+  namale <- subset(stats19,region==x&is.na(strike_male))
+  naage <- subset(stats19,region==x&is.na(strike_age))
+  naagem <- subset(stats19,region==x&is.na(strike_male)&is.na(strike_age))
+  c(nrow(naage)/nrow(brist),nrow(namale)/nrow(brist),nrow(naagem)/nrow(brist))
+})
+norm_cities <- apply(cities,2,function(x)x/max(x))
+if(!exists('las')) las <- sapply(unique(stats19$local_authority_.highway.),function(x){
+  brist <- subset(stats19,local_authority_.highway.==x)
+  namale <- subset(stats19,local_authority_.highway.==x&is.na(strike_male))
+  naage <- subset(stats19,local_authority_.highway.==x&is.na(strike_age))
+  naagem <- subset(stats19,local_authority_.highway.==x&is.na(strike_male)&is.na(strike_age))
+  c(nrow(naage)/nrow(brist),nrow(namale)/nrow(brist),nrow(naagem)/nrow(brist))
+})
+norm_las <- apply(las,2,function(x)x/max(x))
+```
+
+
+Bristol city region, on the other hand, has similar levels for age and gender missingness, which both exceed combined missingness. This suggests there are similar numbers of cases where age is known and gender unknown, and age unknown and gender known. 
+
+```{r plot city completeness,echo=F}
+par(mar=c(6,5,2,2))
+matplot(norm_cities,typ='l',lty=1,lwd=2,col=cols,frame=F,cex.lab=1.5,cex.axis=1.5,xlab='',ylab='Missingness relative to age',xaxt='n',ylim=c(0.3,1))
+axis(1,at=1:3,labels=c('Age','Gender','Both'),las=2,cex.axis=1.5)
+legend(legend=rev(names(codes_for_stats19)),col=rev(cols),x=0.9,y=0.72,bty='n',lwd=2)
+
+```
+
+This pattern is seen in all the LAs that make up that city region. Likewise, the pattern for Greater Manchester is evident in all its LAs. 
+
+```{r plot la completeness,echo=F}
+par(mar=c(6,5,2,2))
+matplot(norm_las,typ='l',lty=1,lwd=2,col=cols[match(byla[,1],names(codes_for_stats19))],frame=F,cex.lab=1.5,cex.axis=1.5,xlab='',ylab='Missingness relative to age',xaxt='n',ylim=c(0.3,1))
+axis(1,at=1:3,labels=c('Age','Gender','Both'),las=2,cex.axis=1.5)
+legend(legend=rev(names(codes_for_stats19)),col=rev(cols),x=0.9,y=0.72,bty='n',lwd=2)
+
+```
+```{r save,echo=F}
+
+
+saved_objects=list(stats19=stats19,age_region=age_region,age_la=age_la,age_completeness=age_completeness,gender_completeness=gender_completeness,completeness=completeness,cities=cities,las=las,codes_for_stats19=codes_for_stats19)
+saveRDS(saved_objects,'saved_objects.Rds')
+
+```
+
+## In conclusion?
+
+ There are some curiosities in RTC recording by different city regions, and we don't know why.
